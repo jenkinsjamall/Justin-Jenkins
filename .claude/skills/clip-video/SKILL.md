@@ -1,82 +1,98 @@
 ---
 name: clip-video
-description: Turn a long-form video (YouTube link or hosted file) into short vertical clips with B-roll suggestions, titles, and posting metadata using the vidIQ MCP tools. Use when the user asks to clip a video, make shorts/reels from a video, or run the clipping pipeline.
+description: Turn a long-form video into short vertical clips with captions and contextual B-roll overlays using the DIY pipeline in pipeline/ (yt-dlp, faster-whisper, ffmpeg, Pexels). Use when the user asks to clip a video, make shorts/reels, or run the clipping pipeline.
 ---
 
-# Clip a long-form video into shorts
+# Clip a long-form video into shorts (DIY pipeline)
 
-Run this pipeline using the vidIQ MCP tools (`mcp__*__vidiq_*`). Load tool
-schemas with ToolSearch first if they aren't loaded.
+Free, unlimited pipeline — no vidIQ credits. Helper scripts live in
+`pipeline/`. Work in a scratch dir like `/tmp/clips/<video-slug>/`.
 
 ## 0. Pre-flight
 
-1. Call `vidiq_balance`. Clip generation costs **9 credits per minute of
-   source video, rounded up**. If the source video is longer than
-   `totalCredits / 9` minutes, STOP and tell the user the cost before
-   proceeding — suggest a shorter video or a segment instead.
-2. Confirm the user has rights to clip this content (their own video, a
-   clipping-program video, or a client's). If it's clearly third-party content
-   with no permission mentioned, ask before spending credits.
+1. Ensure tools: run `scripts/install_pipeline.sh` if `ffmpeg` or
+   `yt-dlp`/`faster-whisper` are missing (a SessionStart hook normally does
+   this).
+2. Check `PEXELS_API_KEY` is set (environment variable from the cloud
+   environment settings).
+3. Check network: `curl -s -o /dev/null -w "%{http_code}"` against
+   `https://www.youtube.com`, `https://api.pexels.com`, and
+   `https://huggingface.co`. If any return 403 with header
+   `x-deny-reason: host_not_allowed`, tell the user to add the missing hosts
+   to the environment's Custom network allowlist (`www.youtube.com`,
+   `*.youtube.com`, `*.googlevideo.com`, `*.pexels.com`, `api.pexels.com`,
+   `huggingface.co`, `*.huggingface.co`, `*.hf.co`) and start a fresh
+   session. Only fall back to the vidIQ MCP tools (`vidiq_generate_clips`,
+   `vidiq_generate_broll`) if the user agrees to spend credits.
+4. Confirm the user has rights to clip the content (their own, a clipping
+   program's, or a client's). Ask before proceeding if unclear.
 
-## 1. Generate clips
+## 1. Download the source
 
-Call `vidiq_generate_clips` with:
-- `videoUrl` for a YouTube link (duration is fetched automatically), or
-  `uploadedVideoUrl` + `videoDuration` + `videoFilename` for a hosted file.
-- `prompt`: steer moment selection from the user's intent (e.g. "funniest
-  exchanges", "hot takes and debates", "actionable advice moments").
-- `clipDuration`: default to 30–45s for Reels/TikTok unless the user
-  specifies.
+```
+yt-dlp -f "bv*[height<=1080]+ba/b" --merge-output-format mp4 -o source.mp4 <URL>
+```
 
-This is async — it returns an `mcpJobId`. Poll `vidiq_job_poll` with that id
-until status is `completed` (failures auto-refund credits). Do not use Bash
-sleep loops; poll the tool directly between other work.
+## 2. Transcribe
 
-## 2. Enhance each clip
+```
+python3 pipeline/transcribe.py source.mp4 transcript.json
+```
 
-For each generated clip:
-1. **B-roll:** identify 2–3 concrete visual subjects from the clip's
-   transcript/topic and call `vidiq_generate_broll` with
-   `orientation: "portrait"` for each. Give the user the mp4 links and the
-   required photographer attribution for every clip they use.
-2. **Titles/hooks:** call `vidiq_generate_titles` for title and hook-text
-   options; optionally `vidiq_score_title` on the user's favorite.
+First run downloads the Whisper model (~75MB) from Hugging Face. A 1-hour
+episode takes several minutes on CPU — start it early.
 
-## 3. Assemble B-roll overlays (when network access allows)
+## 3. Pick moments (this is the judgment step — do it well)
 
-The B-roll mechanic from the original reel: derive search terms from what's
-being said in each transcript segment, fetch matching stock clips, and overlay
-them at those exact timestamps.
+Read `transcript.json` and choose 30–45s windows that work as standalone
+clips. Use the user's steer (e.g. "funniest parts") if given. Favor:
+- A strong first line that works as a hook out of context.
+- Self-contained stories, hot takes, debates, punchlines.
+- Clean start/end boundaries on sentence edges (snap to word timestamps).
 
-1. Check host access first: `curl -s -o /dev/null -w "%{http_code}" https://videos.pexels.com`.
-   If 403 with `x-deny-reason: host_not_allowed`, the environment's network
-   policy blocks downloads — tell the user to allow `*.pexels.com` (and
-   `www.youtube.com` + `*.googlevideo.com` for source downloads) in their
-   Claude Code environment settings, then deliver links-only (step 4).
-2. Install ffmpeg if missing (`apt-get update && apt-get install -y ffmpeg`).
-3. Download clip + B-roll mp4s with curl, then overlay each B-roll segment
-   full-frame at its timestamp, keeping the original audio:
-   ```
-   ffmpeg -i clip.mp4 -i broll1.mp4 -filter_complex \
-     "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,trim=0:3,setpts=PTS+START/TB[b1]; \
-      [0:v][b1]overlay=enable='between(t,START,START+3)'" \
-     -map 0:a -c:a copy out.mp4
-   ```
-   (Replace START with the transcript timestamp; chain more overlay pairs for
-   additional B-roll. 2–4 second overlays, never covering the hook line.)
-4. Add the Pexels photographer credit for every clip used to the caption text.
+Propose 3–5 moments with timestamp ranges and a one-line rationale each.
 
-## 4. Deliver
+## 4. Cut each clip
 
-Present results as a table per clip: timestamp range in the source, clip link,
-suggested hook/title, B-roll links + credits, and a suggested caption with
-3–5 niche hashtags. Remind the user of any program-specific requirements
-(watermarks, creator tags) if they mentioned a clipping program.
+```
+python3 pipeline/cut.py source.mp4 transcript.json START END clipN.mp4
+```
 
-## 5. Optional research add-ons
+Produces a 1080x1920 center-cropped clip plus `clipN.srt` (captions timed to
+the clip). Note: center-crop suits single-speaker framing; for off-center
+speakers, adjust the crop filter manually.
+
+## 5. B-roll (the mechanic from the reel)
+
+For each clip, derive 2–3 concrete, visual search terms from what's being
+said in that segment (e.g. someone describing a dunk → "basketball player
+dunking"). Then:
+
+```
+python3 pipeline/broll.py "search query" broll/
+python3 pipeline/overlay.py clipN.mp4 clipN_b.mp4 broll/file.mp4:START:3 [...]
+```
+
+START is seconds within the clip. Keep overlays 2–4s, max ~1 per 10s, and
+never cover the opening hook line. `broll/credits.txt` accumulates required
+Pexels attributions — they must go in the post caption.
+
+## 6. Burn captions (always last, on top of overlays)
+
+```
+python3 pipeline/caption.py clipN_b.mp4 clipN.srt clipN_final.mp4
+```
+
+## 7. Deliver
+
+Send the final clips with SendUserFile. For each clip include: source
+timestamp range, suggested hook/title, a ready-to-paste caption with 3–5
+niche hashtags plus the Pexels credits, and any clipping-program
+requirements the user mentioned (watermarks, creator tags).
+
+## 8. Optional research add-ons (vidIQ, cheap)
 
 - `vidiq_outliers` / `vidiq_ig_outlier_reels_search` — find overperforming
-  shorts in the niche to steer the selection `prompt` before generating.
-- `vidiq_keyword_research` — hashtag/keyword ideas for captions.
-- `vidiq_video_transcript` — pull a transcript first if the user wants to
-  pick moments manually before spending generation credits.
+  shorts in the niche before picking moments.
+- `vidiq_generate_titles` / `vidiq_score_title` — title and hook options.
+- `vidiq_keyword_research` — caption keywords/hashtags.
